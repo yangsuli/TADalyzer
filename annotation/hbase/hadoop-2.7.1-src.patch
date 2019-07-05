@@ -1,0 +1,417 @@
+diff --git a/hadoop-2.7.1-src/hadoop-common-project/hadoop-common/src/main/bin/hadoop-config.sh b/hadoop-2.7.1-src/hadoop-common-project/hadoop-common/src/main/bin/hadoop-config.sh
+index 3c3c19f3c..adb0ed1b5 100644
+--- a/hadoop-2.7.1-src/hadoop-common-project/hadoop-common/src/main/bin/hadoop-config.sh
++++ b/hadoop-2.7.1-src/hadoop-common-project/hadoop-common/src/main/bin/hadoop-config.sh
+@@ -245,6 +245,12 @@ if [ -d "${HADOOP_PREFIX}/build/native" -o -d "${HADOOP_PREFIX}/$HADOOP_COMMON_L
+   fi
+ fi
+ 
++if [ "x$JAVA_LIBRARY_PATH" != "x" ]; then
++  JAVA_LIBRARY_PATH=${JAVA_LIBRARY_PATH}:${HADOOP_PREFIX}/set_stage
++else
++  JAVA_LIBRARY_PATH=${HADOOP_PREFIX}/set_stage
++fi
++
+ # setup a default TOOL_PATH
+ TOOL_PATH="${TOOL_PATH:-$HADOOP_PREFIX/share/hadoop/tools/lib/*}"
+ 
+diff --git a/hadoop-2.7.1-src/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFCRpcServer.java b/hadoop-2.7.1-src/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFCRpcServer.java
+index 7ea5188ad..f028e71a0 100644
+--- a/hadoop-2.7.1-src/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFCRpcServer.java
++++ b/hadoop-2.7.1-src/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFCRpcServer.java
+@@ -33,6 +33,7 @@ import org.apache.hadoop.ipc.RPC.Server;
+ import org.apache.hadoop.security.AccessControlException;
+ import org.apache.hadoop.security.authorize.PolicyProvider;
+ 
++
+ import com.google.protobuf.BlockingService;
+ 
+ @InterfaceAudience.LimitedPrivate("HDFS")
+diff --git a/hadoop-2.7.1-src/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Server.java b/hadoop-2.7.1-src/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Server.java
+index f63b54fd8..7a2823081 100644
+--- a/hadoop-2.7.1-src/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Server.java
++++ b/hadoop-2.7.1-src/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Server.java
+@@ -116,6 +116,7 @@ import org.apache.hadoop.util.ProtoUtil;
+ import org.apache.hadoop.util.ReflectionUtils;
+ import org.apache.hadoop.util.StringUtils;
+ import org.apache.hadoop.util.Time;
++import org.apache.hadoop.util.SetStage;
+ import org.apache.htrace.Span;
+ import org.apache.htrace.Trace;
+ import org.apache.htrace.TraceInfo;
+@@ -603,6 +604,7 @@ public abstract class Server {
+       
+       @Override
+       public void run() {
++        SetStage.setStage(SetStage.HDFS_RPC_READER_STAGE);
+         LOG.info("Starting " + Thread.currentThread().getName());
+         try {
+           doRunLoop();
+@@ -833,6 +835,7 @@ public abstract class Server {
+ 
+     @Override
+     public void run() {
++      SetStage.setStage(SetStage.HDFS_RPC_RESPONDER_STAGE);
+       LOG.info(Thread.currentThread().getName() + ": starting");
+       SERVER.set(Server.this);
+       try {
+@@ -2000,13 +2003,17 @@ public abstract class Server {
+ 
+   /** Handles queued calls . */
+   private class Handler extends Thread {
+-    public Handler(int instanceNumber) {
++    private int stageId;
++
++    public Handler(int instanceNumber, int stageId) {
+       this.setDaemon(true);
+       this.setName("IPC Server handler "+ instanceNumber + " on " + port);
++      this.stageId = stageId;
+     }
+ 
+     @Override
+     public void run() {
++      SetStage.setStage(stageId);
+       LOG.debug(Thread.currentThread().getName() + ": starting");
+       SERVER.set(Server.this);
+       ByteArrayOutputStream buf = 
+@@ -2431,13 +2438,17 @@ public abstract class Server {
+   public void setSocketSendBufSize(int size) { this.socketSendBufferSize = size; }
+ 
+   /** Starts the service.  Must be called before any calls will be handled. */
+-  public synchronized void start() {
++  public void start(){
++     this.start(SetStage.NULL_STAGE);
++  }
++
++  public synchronized void start(int stageId) {
+     responder.start();
+     listener.start();
+     handlers = new Handler[handlerCount];
+     
+     for (int i = 0; i < handlerCount; i++) {
+-      handlers[i] = new Handler(i);
++      handlers[i] = new Handler(i, stageId);
+       handlers[i].start();
+     }
+   }
+diff --git a/hadoop-2.7.1-src/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/SetStage.java b/hadoop-2.7.1-src/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/SetStage.java
+new file mode 100644
+index 000000000..38ddfd2d0
+--- /dev/null
++++ b/hadoop-2.7.1-src/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/SetStage.java
+@@ -0,0 +1,49 @@
++package org.apache.hadoop.util;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++
++public class SetStage {
++   public static native int get_nid();
++   public static native void set_stage(int stage_id);
++
++   private static final Log LOG =
++      LogFactory.getLog(SetStage.class.getName());
++
++   public static void setStage(int stageId){
++      set_stage(stageId);
++      int nid = get_nid();
++      LOG.info("Thread " + nid + " called setStage " + stageId);
++   }
++
++   public static final int NULL_STAGE = 0;
++   public static final int HDFS_NN_SERVICE_RPC_STAGE = 1;
++   public static final int HDFS_NN_CLIENT_RPC_STAGE = 2;
++   public static final int HDFS_DN_IPC_STAGE = 3;
++   public static final int HDFS_RPC_RESPONDER_STAGE = 4;
++   public static final int HDFS_RPC_READER_STAGE = 5;
++   public static final int HDFS_DN_DATA_XCEIVER_STAGE = 6;
++   public static final int HDFS_DN_PACKET_RESPONDER_STAGE = 7;
++   public static final int HDFS_DATA_STREAMER_STAGE = 8;
++   public static final int HDFS_RESPONSE_PROCESS_STAGE = 9;
++   public static final int HBASE_RS_RPC_STAGE = 10;
++   public static final int HBASE_RPC_READER_STAGE = 11;
++   public static final int HBASE_RPC_RESPONDER_STAGE = 12;
++   public static final int HBASE_LONG_COMPACTION_STAGE = 13;
++   public static final int HBASE_SHORT_COMPACTION_STAGE = 14;
++   public static final int HBASE_SPLIT_STAGE = 15;
++   public static final int HBASE_MERGE_STAGE = 16;
++   public static final int HBASE_FLUSH_STAGE = 17;
++   public static final int HBASE_CHORE_STAGE = 18;
++   public static final int HBASE_SYNC_STAGE = 19;
++   public static final int HBASE_EVICT_STAGE = 20;
++   public static final int HBASE_LEASE_STAGE = 21;
++   public static final int HBASE_LOG_ROLL_STAGE = 22;
++   public static final int HBASE_HMASTER_MAIN_STAGE = 23;
++   public static final int HBASE_HRS_MAIN_STAGE = 24;
++   public static final int HBASE_APPEND_STAGE = 25;
++
++   static {
++      System.loadLibrary("set_stage");
++   }
++}
+diff --git a/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java b/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+index f10553083..28d8f342c 100755
+--- a/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
++++ b/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+@@ -95,6 +95,7 @@ import org.apache.hadoop.util.DataChecksum;
+ import org.apache.hadoop.util.DataChecksum.Type;
+ import org.apache.hadoop.util.Progressable;
+ import org.apache.hadoop.util.Time;
++import org.apache.hadoop.util.SetStage;
+ import org.apache.htrace.NullScope;
+ import org.apache.htrace.Sampler;
+ import org.apache.htrace.Span;
+@@ -380,6 +381,7 @@ public class DFSOutputStream extends FSOutputSummer
+      */
+     @Override
+     public void run() {
++      SetStage.setStage(SetStage.HDFS_DATA_STREAMER_STAGE);
+       long lastPacket = Time.monotonicNow();
+       TraceScope scope = NullScope.INSTANCE;
+       while (!streamerClosed && dfsClient.clientRunning) {
+@@ -721,6 +723,7 @@ public class DFSOutputStream extends FSOutputSummer
+ 
+       @Override
+       public void run() {
++        SetStage.setStage(SetStage.HDFS_RESPONSE_PROCESS_STAGE);
+ 
+         setName("ResponseProcessor for block " + block);
+         PipelineAck ack = new PipelineAck();
+diff --git a/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java b/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+index bc6c540e6..7ff6d100a 100644
+--- a/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
++++ b/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+@@ -58,6 +58,7 @@ import org.apache.hadoop.util.Daemon;
+ import org.apache.hadoop.util.DataChecksum;
+ import org.apache.hadoop.util.StringUtils;
+ import org.apache.hadoop.util.Time;
++import org.apache.hadoop.util.SetStage;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ 
+@@ -1220,6 +1221,7 @@ class BlockReceiver implements Closeable {
+      */
+     @Override
+     public void run() {
++      SetStage.setStage(SetStage.HDFS_DN_PACKET_RESPONDER_STAGE);
+       boolean lastPacketInBlock = false;
+       final long startTime = ClientTraceLog.isInfoEnabled() ? System.nanoTime() : 0;
+       while (isRunning() && !lastPacketInBlock) {
+diff --git a/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java b/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+index c39540eff..c2ade0ee9 100644
+--- a/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
++++ b/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+@@ -190,6 +190,7 @@ import org.apache.hadoop.tracing.TraceAdminPB.TraceAdminService;
+ import org.apache.hadoop.tracing.TraceAdminProtocolPB;
+ import org.apache.hadoop.tracing.TraceAdminProtocolServerSideTranslatorPB;
+ import org.apache.hadoop.util.Daemon;
++import org.apache.hadoop.util.SetStage;
+ import org.apache.hadoop.util.DiskChecker;
+ import org.apache.hadoop.util.DiskChecker.DiskErrorException;
+ import org.apache.hadoop.util.GenericOptionsParser;
+@@ -2210,7 +2211,7 @@ public class DataNode extends ReconfigurableBase
+     if (localDataXceiverServer != null) {
+       localDataXceiverServer.start();
+     }
+-    ipcServer.start();
++    ipcServer.start(SetStage.HDFS_DN_IPC_STAGE);
+     startPlugins(conf);
+   }
+ 
+diff --git a/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java b/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+index 01ff32daf..3cbfa8f4f 100644
+--- a/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
++++ b/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+@@ -89,6 +89,7 @@ import org.apache.hadoop.util.DataChecksum;
+ import com.google.common.base.Preconditions;
+ import com.google.protobuf.ByteString;
+ import org.apache.hadoop.util.Time;
++import org.apache.hadoop.util.SetStage;
+ 
+ 
+ /**
+@@ -180,6 +181,7 @@ class DataXceiver extends Receiver implements Runnable {
+    */
+   @Override
+   public void run() {
++    SetStage.setStage(SetStage.HDFS_DN_DATA_XCEIVER_STAGE);
+     int opsProcessed = 0;
+     Op op = null;
+ 
+diff --git a/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java b/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+index c057f3e94..7488fda1b 100644
+--- a/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
++++ b/hadoop-2.7.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+@@ -180,6 +180,7 @@ import org.apache.hadoop.tracing.TraceAdminProtocolPB;
+ import org.apache.hadoop.tracing.TraceAdminProtocolServerSideTranslatorPB;
+ import org.apache.hadoop.util.VersionInfo;
+ import org.apache.hadoop.util.VersionUtil;
++import org.apache.hadoop.util.SetStage;
+ import org.slf4j.Logger;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+@@ -427,9 +428,9 @@ class NameNodeRpcServer implements NamenodeProtocols {
+    * Start client and service RPC servers.
+    */
+   void start() {
+-    clientRpcServer.start();
++    clientRpcServer.start(SetStage.HDFS_NN_CLIENT_RPC_STAGE);
+     if (serviceRpcServer != null) {
+-      serviceRpcServer.start();      
++      serviceRpcServer.start(SetStage.HDFS_NN_SERVICE_RPC_STAGE);      
+     }
+   }
+   
+diff --git a/hadoop-2.7.1-src/install.sh b/hadoop-2.7.1-src/install.sh
+new file mode 100644
+index 000000000..c10000780
+--- /dev/null
++++ b/hadoop-2.7.1-src/install.sh
+@@ -0,0 +1,12 @@
++mvn install --offline -e -DskipTests -Pdist -Pnative -Dmaven.javadoc.skip=true -Dmaven.test.skip=true
++
++#compile set_stage library
++cd set_stage
++bash make.sh
++cd ..
++
++cp -R set_stage hadoop-dist/target/hadoop-2.7.1/
++cp format_clean.sh hadoop-dist/target/hadoop-2.7.1/
++cp format_clusterID.sh hadoop-dist/target/hadoop-2.7.1/
++cp ~/thread-arch/setup/hadoop/core-site.xml hadoop-dist/target/hadoop-2.7.1/etc/hadoop/
+diff --git a/hadoop-2.7.1-src/set_stage/make.sh b/hadoop-2.7.1-src/set_stage/make.sh
+new file mode 100644
+index 000000000..22462a841
+--- /dev/null
++++ b/hadoop-2.7.1-src/set_stage/make.sh
+@@ -0,0 +1,6 @@
++pwd=`pwd`
++cd ../hadoop-common-project/hadoop-common/target/classes
++javah org.apache.hadoop.util.SetStage
++mv org_apache_hadoop_util_SetStage.h $pwd
++cd $pwd
++gcc -I"/usr/lib/jvm/java-8-oracle/include" -I"/usr/lib/jvm/java-8-oracle/include/linux" -o libset_stage.so -shared -Wl,-soname,set_stage.so set_stage.c -lc -fPIC
+diff --git a/hadoop-2.7.1-src/set_stage/org_apache_hadoop_util_SetStage.h b/hadoop-2.7.1-src/set_stage/org_apache_hadoop_util_SetStage.h
+new file mode 100644
+index 000000000..054e40627
+--- /dev/null
++++ b/hadoop-2.7.1-src/set_stage/org_apache_hadoop_util_SetStage.h
+@@ -0,0 +1,81 @@
++/* DO NOT EDIT THIS FILE - it is machine generated */
++#include <jni.h>
++/* Header for class org_apache_hadoop_util_SetStage */
++
++#ifndef _Included_org_apache_hadoop_util_SetStage
++#define _Included_org_apache_hadoop_util_SetStage
++#ifdef __cplusplus
++extern "C" {
++#endif
++#undef org_apache_hadoop_util_SetStage_NULL_STAGE
++#define org_apache_hadoop_util_SetStage_NULL_STAGE 0L
++#undef org_apache_hadoop_util_SetStage_HDFS_NN_SERVICE_RPC_STAGE
++#define org_apache_hadoop_util_SetStage_HDFS_NN_SERVICE_RPC_STAGE 1L
++#undef org_apache_hadoop_util_SetStage_HDFS_NN_CLIENT_RPC_STAGE
++#define org_apache_hadoop_util_SetStage_HDFS_NN_CLIENT_RPC_STAGE 2L
++#undef org_apache_hadoop_util_SetStage_HDFS_DN_IPC_STAGE
++#define org_apache_hadoop_util_SetStage_HDFS_DN_IPC_STAGE 3L
++#undef org_apache_hadoop_util_SetStage_HDFS_RPC_RESPONDER_STAGE
++#define org_apache_hadoop_util_SetStage_HDFS_RPC_RESPONDER_STAGE 4L
++#undef org_apache_hadoop_util_SetStage_HDFS_RPC_READER_STAGE
++#define org_apache_hadoop_util_SetStage_HDFS_RPC_READER_STAGE 5L
++#undef org_apache_hadoop_util_SetStage_HDFS_DN_DATA_XCEIVER_STAGE
++#define org_apache_hadoop_util_SetStage_HDFS_DN_DATA_XCEIVER_STAGE 6L
++#undef org_apache_hadoop_util_SetStage_HDFS_DN_PACKET_RESPONDER_STAGE
++#define org_apache_hadoop_util_SetStage_HDFS_DN_PACKET_RESPONDER_STAGE 7L
++#undef org_apache_hadoop_util_SetStage_HDFS_DATA_STREAMER_STAGE
++#define org_apache_hadoop_util_SetStage_HDFS_DATA_STREAMER_STAGE 8L
++#undef org_apache_hadoop_util_SetStage_HDFS_RESPONSE_PROCESS_STAGE
++#define org_apache_hadoop_util_SetStage_HDFS_RESPONSE_PROCESS_STAGE 9L
++#undef org_apache_hadoop_util_SetStage_HBASE_RS_RPC_STAGE
++#define org_apache_hadoop_util_SetStage_HBASE_RS_RPC_STAGE 10L
++#undef org_apache_hadoop_util_SetStage_HBASE_RPC_READER_STAGE
++#define org_apache_hadoop_util_SetStage_HBASE_RPC_READER_STAGE 11L
++#undef org_apache_hadoop_util_SetStage_HBASE_RPC_RESPONDER_STAGE
++#define org_apache_hadoop_util_SetStage_HBASE_RPC_RESPONDER_STAGE 12L
++#undef org_apache_hadoop_util_SetStage_HBASE_LONG_COMPACTION_STAGE
++#define org_apache_hadoop_util_SetStage_HBASE_LONG_COMPACTION_STAGE 13L
++#undef org_apache_hadoop_util_SetStage_HBASE_SHORT_COMPACTION_STAGE
++#define org_apache_hadoop_util_SetStage_HBASE_SHORT_COMPACTION_STAGE 14L
++#undef org_apache_hadoop_util_SetStage_HBASE_SPLIT_STAGE
++#define org_apache_hadoop_util_SetStage_HBASE_SPLIT_STAGE 15L
++#undef org_apache_hadoop_util_SetStage_HBASE_MERGE_STAGE
++#define org_apache_hadoop_util_SetStage_HBASE_MERGE_STAGE 16L
++#undef org_apache_hadoop_util_SetStage_HBASE_FLUSH_STAGE
++#define org_apache_hadoop_util_SetStage_HBASE_FLUSH_STAGE 17L
++#undef org_apache_hadoop_util_SetStage_HBASE_CHORE_STAGE
++#define org_apache_hadoop_util_SetStage_HBASE_CHORE_STAGE 18L
++#undef org_apache_hadoop_util_SetStage_HBASE_SYNC_STAGE
++#define org_apache_hadoop_util_SetStage_HBASE_SYNC_STAGE 19L
++#undef org_apache_hadoop_util_SetStage_HBASE_EVICT_STAGE
++#define org_apache_hadoop_util_SetStage_HBASE_EVICT_STAGE 20L
++#undef org_apache_hadoop_util_SetStage_HBASE_LEASE_STAGE
++#define org_apache_hadoop_util_SetStage_HBASE_LEASE_STAGE 21L
++#undef org_apache_hadoop_util_SetStage_HBASE_LOG_ROLL_STAGE
++#define org_apache_hadoop_util_SetStage_HBASE_LOG_ROLL_STAGE 22L
++#undef org_apache_hadoop_util_SetStage_HBASE_HMASTER_MAIN_STAGE
++#define org_apache_hadoop_util_SetStage_HBASE_HMASTER_MAIN_STAGE 23L
++#undef org_apache_hadoop_util_SetStage_HBASE_HRS_MAIN_STAGE
++#define org_apache_hadoop_util_SetStage_HBASE_HRS_MAIN_STAGE 24L
++#undef org_apache_hadoop_util_SetStage_HBASE_APPEND_STAGE
++#define org_apache_hadoop_util_SetStage_HBASE_APPEND_STAGE 25L
++/*
++ * Class:     org_apache_hadoop_util_SetStage
++ * Method:    get_nid
++ * Signature: ()I
++ */
++JNIEXPORT jint JNICALL Java_org_apache_hadoop_util_SetStage_get_1nid
++  (JNIEnv *, jclass);
++
++/*
++ * Class:     org_apache_hadoop_util_SetStage
++ * Method:    set_stage
++ * Signature: (I)V
++ */
++JNIEXPORT void JNICALL Java_org_apache_hadoop_util_SetStage_set_1stage
++  (JNIEnv *, jclass, jint);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/hadoop-2.7.1-src/set_stage/set_stage.c b/hadoop-2.7.1-src/set_stage/set_stage.c
+new file mode 100644
+index 000000000..659b056ab
+--- /dev/null
++++ b/hadoop-2.7.1-src/set_stage/set_stage.c
+@@ -0,0 +1,31 @@
++#define _GNU_SOURCE
++
++#include <jni.h>
++#include <stdio.h>
++#include "org_apache_hadoop_util_SetStage.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <pthread.h>
++#include </usr/include/sched.h>
++#include <unistd.h>
++#include <sys/syscall.h>
++
++pid_t gettid(){
++#ifdef SYS_gettid
++  pid_t tid = syscall(SYS_gettid);
++#else
++#error "SYS_gettid unavailable on this system"
++#endif
++}
++
++JNIEXPORT jint JNICALL Java_org_apache_hadoop_util_SetStage_get_1nid(JNIEnv *env, jclass class){
++  int tid = gettid();
++  return tid;
++}
++
++JNIEXPORT void JNICALL Java_org_apache_hadoop_util_SetStage_set_1stage(JNIEnv *env, jclass class, jint stage_id){
++   int tid = gettid();
++ //  printf("thread %d set stage to %d\n", tid, stage_id);
++  // fflush(stdout);
++}
++

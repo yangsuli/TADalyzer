@@ -1,0 +1,827 @@
+diff --git a/hbase/hbase-common/src/main/java/org/apache/hadoop/hbase/ChoreService.java b/hbase/hbase-common/src/main/java/org/apache/hadoop/hbase/ChoreService.java
+index 1623c10c1..64e1c4aad 100644
+--- a/hbase/hbase-common/src/main/java/org/apache/hadoop/hbase/ChoreService.java
++++ b/hbase/hbase-common/src/main/java/org/apache/hadoop/hbase/ChoreService.java
+@@ -30,6 +30,7 @@ import java.util.concurrent.atomic.AtomicInteger;
+ import com.google.common.annotations.VisibleForTesting;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.util.SetStage;
+ import org.apache.hadoop.hbase.ScheduledChore.ChoreServicer;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.classification.InterfaceStability;
+@@ -260,8 +261,15 @@ public class ChoreService implements ChoreServicer {
+ 
+     @Override
+     public Thread newThread(Runnable r) {
++      Runnable newRunnable = new Runnable(){
++          @Override
++          public void run(){
++              SetStage.setStage(SetStage.HBASE_CHORE_STAGE);
++              r.run();
++          }
++      };
+       Thread thread =
+-          new Thread(r, threadPrefix + THREAD_NAME_SUFFIX + threadNumber.getAndIncrement());
++          new Thread(newRunnable, threadPrefix + THREAD_NAME_SUFFIX + threadNumber.getAndIncrement());
+       thread.setDaemon(true);
+       return thread;
+     }
+diff --git a/hbase/hbase-common/src/main/java/org/apache/hadoop/hbase/util/Threads.java b/hbase/hbase-common/src/main/java/org/apache/hadoop/hbase/util/Threads.java
+index d10e0f206..5fac11264 100644
+--- a/hbase/hbase-common/src/main/java/org/apache/hadoop/hbase/util/Threads.java
++++ b/hbase/hbase-common/src/main/java/org/apache/hadoop/hbase/util/Threads.java
+@@ -34,6 +34,7 @@ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.util.ReflectionUtils;
+ import org.apache.hadoop.util.StringUtils;
++import org.apache.hadoop.util.SetStage;
+ 
+ import com.google.common.base.Preconditions;
+ 
+@@ -222,6 +223,45 @@ public class Threads {
+     };
+   }
+ 
++  public static ThreadFactory getNamedStageThreadFactory(final String prefix, int stageId){
++    SecurityManager s = System.getSecurityManager();
++    final ThreadGroup threadGroup = (s != null) ? s.getThreadGroup() : Thread.currentThread()
++        .getThreadGroup();
++
++    return new ThreadFactory() {
++      final AtomicInteger threadNumber = new AtomicInteger(1);
++      private final int poolNumber = Threads.poolNumber.getAndIncrement();
++      final ThreadGroup group = threadGroup;
++
++	/*
++      @Override
++      public Thread newThread(Runnable r) {
++        final String name = prefix + "-pool" + poolNumber + "-t" + threadNumber.getAndIncrement();
++	Runnable new_r = new Runnable(){
++		@Override
++		public void run(){
++		 	SetStage.setStage(stageId);
++			r.run();
++		}
++	};
++        return new Thread(group, new_r, name);
++      }*/
++
++      @Override
++      public Thread newThread(Runnable r){
++        final String name = prefix + "-pool" + poolNumber + "-t" + threadNumber.getAndIncrement();
++	return new Thread(group, r, name){
++	@Override
++	public void run(){
++		SetStage.setStage(stageId);
++		super.run();
++	}
++    };
++    }
++
++  };
++  }
++
+   /**
+    * Same as {#newDaemonThreadFactory(String, UncaughtExceptionHandler)},
+    * without setting the exception handler.
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/LruBlockCache.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/LruBlockCache.java
+index 99b67ba8e..34e736b10 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/LruBlockCache.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/LruBlockCache.java
+@@ -37,6 +37,7 @@ import java.util.concurrent.locks.ReentrantLock;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.util.SetStage;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.io.HeapSize;
+ import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;
+@@ -861,6 +862,7 @@ public class LruBlockCache implements ResizableBlockCache, HeapSize {
+ 
+     @Override
+     public void run() {
++      SetStage.setStage(SetStage.HBASE_EVICT_STAGE);
+       enteringRun = true;
+       while (this.go) {
+         synchronized(this) {
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/BalancedQueueRpcExecutor.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/BalancedQueueRpcExecutor.java
+index 241d36ea3..34b3ac635 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/BalancedQueueRpcExecutor.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/BalancedQueueRpcExecutor.java
+@@ -45,24 +45,24 @@ public class BalancedQueueRpcExecutor extends RpcExecutor {
+   private final QueueBalancer balancer;
+ 
+   public BalancedQueueRpcExecutor(final String name, final int handlerCount, final int numQueues,
+-      final int maxQueueLength) {
+-    this(name, handlerCount, numQueues, maxQueueLength, null, null);
++      final int maxQueueLength, int stageId) {
++    this(name, handlerCount, numQueues, maxQueueLength, null, null, stageId);
+   }
+ 
+   public BalancedQueueRpcExecutor(final String name, final int handlerCount, final int numQueues,
+-      final int maxQueueLength, final Configuration conf, final Abortable abortable) {
+-    this(name, handlerCount, numQueues, conf, abortable, LinkedBlockingQueue.class, maxQueueLength);
++      final int maxQueueLength, final Configuration conf, final Abortable abortable, int stageId) {
++    this(name, handlerCount, numQueues, conf, abortable, stageId, LinkedBlockingQueue.class, maxQueueLength);
+   }
+ 
+-  public BalancedQueueRpcExecutor(final String name, final int handlerCount, final int numQueues,
++  public BalancedQueueRpcExecutor(final String name, final int handlerCount, final int numQueues, int stageId,
+       final Class<? extends BlockingQueue> queueClass, Object... initargs) {
+-    this(name, handlerCount, numQueues, null, null,  queueClass, initargs);
++    this(name, handlerCount, numQueues, null, null, stageId, queueClass, initargs);
+   }
+ 
+-  public BalancedQueueRpcExecutor(final String name, final int handlerCount, final int numQueues,
+-      final Configuration conf, final Abortable abortable,
++  public BalancedQueueRpcExecutor(final String name, final int handlerCount, final int numQueues, 
++      final Configuration conf, final Abortable abortable, int stageId,
+       final Class<? extends BlockingQueue> queueClass, Object... initargs) {
+-    super(name, Math.max(handlerCount, numQueues), conf, abortable);
++    super(name, Math.max(handlerCount, numQueues), conf, abortable, stageId);
+     queues = new ArrayList<BlockingQueue<CallRunner>>(numQueues);
+     this.balancer = getBalancer(numQueues);
+     initializeQueues(numQueues, queueClass, initargs);
+@@ -104,4 +104,4 @@ public class BalancedQueueRpcExecutor extends RpcExecutor {
+   public List<BlockingQueue<CallRunner>> getQueues() {
+     return queues;
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/FastPathBalancedQueueRpcExecutor.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/FastPathBalancedQueueRpcExecutor.java
+index 4e06f4f39..84543f8a2 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/FastPathBalancedQueueRpcExecutor.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/FastPathBalancedQueueRpcExecutor.java
+@@ -46,8 +46,8 @@ public class FastPathBalancedQueueRpcExecutor extends BalancedQueueRpcExecutor {
+ 
+   public FastPathBalancedQueueRpcExecutor(final String name, final int handlerCount,
+                                           final int numQueues, final int maxQueueLength, final Configuration conf,
+-                                          final Abortable abortable) {
+-    super(name, handlerCount, numQueues, conf, abortable, LinkedBlockingQueue.class,
++                                          final Abortable abortable, int stageId) {
++    super(name, handlerCount, numQueues, conf, abortable, stageId, LinkedBlockingQueue.class,
+         maxQueueLength);
+   }
+ 
+@@ -55,11 +55,17 @@ public class FastPathBalancedQueueRpcExecutor extends BalancedQueueRpcExecutor {
+                                           int numCallQueues,
+                                           Configuration conf,
+                                           Abortable abortable,
++					  int stageId,
+                                           Class<? extends BlockingQueue> queueClass,
+                                           Object... args) {
+-    super(name, handlerCount, numCallQueues, conf, abortable, queueClass, args);
++    super(name, handlerCount, numCallQueues, conf, abortable, stageId, queueClass, args);
+   }
+ 
++  /*
++     ADG
++     Disable FastPath for correct queue logging
++     */
++  /*
+   @Override
+   protected Handler getHandler(String name, double handlerFailureThreshhold,
+       BlockingQueue<CallRunner> q) {
+@@ -71,6 +77,7 @@ public class FastPathBalancedQueueRpcExecutor extends BalancedQueueRpcExecutor {
+     FastPathHandler handler = popReadyHandler();
+     return handler != null? handler.loadCallRunner(callTask): super.dispatch(callTask);
+   }
++  */
+ 
+   /**
+    * @return Pop a Handler instance if one available ready-to-go or else return null.
+@@ -89,8 +96,8 @@ public class FastPathBalancedQueueRpcExecutor extends BalancedQueueRpcExecutor {
+     private CallRunner loadedCallRunner;
+ 
+     FastPathHandler(String name, double handlerFailureThreshhold, BlockingQueue<CallRunner> q,
+-        final Deque<FastPathHandler> fastPathHandlerStack) {
+-      super(name, handlerFailureThreshhold, q);
++        final Deque<FastPathHandler> fastPathHandlerStack, int stageId) {
++      super(name, handlerFailureThreshhold, q, stageId);
+       this.fastPathHandlerStack = fastPathHandlerStack;
+     }
+ 
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RWQueueRpcExecutor.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RWQueueRpcExecutor.java
+index 68e7b6541..803de4f7d 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RWQueueRpcExecutor.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RWQueueRpcExecutor.java
+@@ -65,64 +65,65 @@ public class RWQueueRpcExecutor extends RpcExecutor {
+ 
+   public RWQueueRpcExecutor(final String name, final int handlerCount, final int numQueues,
+       final float readShare, final int maxQueueLength,
+-      final Configuration conf, final Abortable abortable) {
++      final Configuration conf, final Abortable abortable, int stageId) {
+     this(name, handlerCount, numQueues, readShare, maxQueueLength, 0,
+-      conf, abortable, LinkedBlockingQueue.class);
++      conf, abortable, stageId, LinkedBlockingQueue.class);
+   }
+ 
+   public RWQueueRpcExecutor(final String name, final int handlerCount, final int numQueues,
+-      final float readShare, final float scanShare, final int maxQueueLength) {
+-    this(name, handlerCount, numQueues, readShare, scanShare, maxQueueLength, null, null);
++      final float readShare, final float scanShare, final int maxQueueLength, int stageId) {
++    this(name, handlerCount, numQueues, readShare, scanShare, maxQueueLength, null, null, stageId);
+   }
+ 
+   public RWQueueRpcExecutor(final String name, final int handlerCount, final int numQueues,
+       final float readShare, final float scanShare, final int maxQueueLength,
+-      final Configuration conf, final Abortable abortable) {
++      final Configuration conf, final Abortable abortable, int stageId) {
+     this(name, handlerCount, numQueues, readShare, scanShare, maxQueueLength,
+-      conf, abortable, LinkedBlockingQueue.class);
++      conf, abortable, stageId, LinkedBlockingQueue.class);
+   }
+ 
+   public RWQueueRpcExecutor(final String name, final int handlerCount, final int numQueues,
+       final float readShare, final int maxQueueLength,
+       final Configuration conf, final Abortable abortable,
++      int stageId,
+       final Class<? extends BlockingQueue> readQueueClass, Object... readQueueInitArgs) {
+-    this(name, handlerCount, numQueues, readShare, 0, maxQueueLength, conf, abortable,
++    this(name, handlerCount, numQueues, readShare, 0, maxQueueLength, conf, abortable, stageId,
+       readQueueClass, readQueueInitArgs);
+   }
+ 
+   public RWQueueRpcExecutor(final String name, final int handlerCount, final int numQueues,
+       final float readShare, final float scanShare, final int maxQueueLength,
+-      final Configuration conf, final Abortable abortable,
++      final Configuration conf, final Abortable abortable, int stageId,
+       final Class<? extends BlockingQueue> readQueueClass, Object... readQueueInitArgs) {
+     this(name, calcNumWriters(handlerCount, readShare), calcNumReaders(handlerCount, readShare),
+-      calcNumWriters(numQueues, readShare), calcNumReaders(numQueues, readShare), scanShare,
++      calcNumWriters(numQueues, readShare), calcNumReaders(numQueues, readShare), scanShare, stageId,
+       LinkedBlockingQueue.class, new Object[] {maxQueueLength},
+       readQueueClass, ArrayUtils.addAll(new Object[] {maxQueueLength}, readQueueInitArgs));
+   }
+ 
+   public RWQueueRpcExecutor(final String name, final int handlerCount, final int numQueues,
+-      final float readShare, final float scanShare,
++      final float readShare, final float scanShare, int stageId,
+       final Class<? extends BlockingQueue> writeQueueClass, Object[] writeQueueInitArgs,
+       final Class<? extends BlockingQueue> readQueueClass, Object[] readQueueInitArgs) {
+     this(name, calcNumWriters(handlerCount, readShare), calcNumReaders(handlerCount, readShare),
+-      calcNumWriters(numQueues, readShare), calcNumReaders(numQueues, readShare), scanShare,
++      calcNumWriters(numQueues, readShare), calcNumReaders(numQueues, readShare), scanShare, stageId,
+       writeQueueClass, writeQueueInitArgs,
+       readQueueClass, readQueueInitArgs);
+   }
+ 
+   public RWQueueRpcExecutor(final String name, final int writeHandlers, final int readHandlers,
+-      final int numWriteQueues, final int numReadQueues,
++      final int numWriteQueues, final int numReadQueues, int stageId,
+       final Class<? extends BlockingQueue> writeQueueClass, Object[] writeQueueInitArgs,
+       final Class<? extends BlockingQueue> readQueueClass, Object[] readQueueInitArgs) {
+-    this(name, writeHandlers, readHandlers, numWriteQueues, numReadQueues, 0,
++    this(name, writeHandlers, readHandlers, numWriteQueues, numReadQueues, 0, stageId,
+       writeQueueClass, writeQueueInitArgs, readQueueClass, readQueueInitArgs);
+   }
+ 
+   public RWQueueRpcExecutor(final String name, int writeHandlers, int readHandlers,
+-      int numWriteQueues, int numReadQueues, float scanShare,
++      int numWriteQueues, int numReadQueues, float scanShare, int stageId,
+       final Class<? extends BlockingQueue> writeQueueClass, Object[] writeQueueInitArgs,
+       final Class<? extends BlockingQueue> readQueueClass, Object[] readQueueInitArgs) {
+-    super(name, Math.max(writeHandlers, numWriteQueues) + Math.max(readHandlers, numReadQueues));
++    super(name, Math.max(writeHandlers, numWriteQueues) + Math.max(readHandlers, numReadQueues), stageId);
+ 
+     int numScanQueues = Math.max(0, (int)Math.floor(numReadQueues * scanShare));
+     int scanHandlers = Math.max(0, (int)Math.floor(readHandlers * scanShare));
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcExecutor.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcExecutor.java
+index 5b6c6c8fe..9d9f07e6e 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcExecutor.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcExecutor.java
+@@ -34,6 +34,7 @@ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.monitoring.MonitoredRPCHandler;
+ import org.apache.hadoop.util.StringUtils;
++import org.apache.hadoop.util.SetStage;
+ 
+ import com.google.common.base.Preconditions;
+ import com.google.common.base.Strings;
+@@ -57,19 +58,21 @@ public abstract class RpcExecutor {
+   private final AtomicInteger failedHandlerCount = new AtomicInteger(0);
+ 
+   private boolean running;
++  private final int stageId;
+ 
+   private Configuration conf = null;
+   private Abortable abortable = null;
+ 
+-  public RpcExecutor(final String name, final int handlerCount) {
++  public RpcExecutor(final String name, final int handlerCount, int stageId) {
+     this.handlers = new ArrayList<Handler>(handlerCount);
+     this.handlerCount = handlerCount;
+     this.name = Strings.nullToEmpty(name);
++    this.stageId = stageId;
+   }
+ 
+   public RpcExecutor(final String name, final int handlerCount, final Configuration conf,
+-      final Abortable abortable) {
+-    this(name, handlerCount);
++      final Abortable abortable, int stageId) {
++    this(name, handlerCount, stageId);
+     this.conf = conf;
+     this.abortable = abortable;
+   }
+@@ -109,7 +112,7 @@ public abstract class RpcExecutor {
+    */
+   protected Handler getHandler(final String name, final double handlerFailureThreshhold,
+       final BlockingQueue<CallRunner> q) {
+-    return new Handler(name, handlerFailureThreshhold, q);
++    return new Handler(name, handlerFailureThreshhold, q, this.stageId);
+   }
+ 
+   /**
+@@ -144,12 +147,15 @@ public abstract class RpcExecutor {
+ 
+     final double handlerFailureThreshhold;
+ 
++    final int stageId;
++
+     Handler(final String name, final double handlerFailureThreshhold,
+-        final BlockingQueue<CallRunner> q) {
++        final BlockingQueue<CallRunner> q, int stageId) {
+       super(name);
+       setDaemon(true);
+       this.q = q;
+       this.handlerFailureThreshhold = handlerFailureThreshhold;
++      this.stageId = stageId;
+     }
+ 
+     /**
+@@ -162,6 +168,7 @@ public abstract class RpcExecutor {
+ 
+     @Override
+     public void run() {
++     SetStage.setStage(this.stageId);
+       boolean interrupted = false;
+       try {
+         while (running) {
+@@ -265,4 +272,4 @@ public abstract class RpcExecutor {
+     }
+     currentQueueLimit = conf.getInt(configKey, currentQueueLimit);
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcServer.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcServer.java
+index 0dbaf04ef..4c82ac082 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcServer.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcServer.java
+@@ -136,6 +136,7 @@ import org.apache.hadoop.security.token.SecretManager;
+ import org.apache.hadoop.security.token.SecretManager.InvalidToken;
+ import org.apache.hadoop.security.token.TokenIdentifier;
+ import org.apache.hadoop.util.StringUtils;
++import org.apache.hadoop.util.SetStage;
+ import org.apache.htrace.TraceInfo;
+ import org.codehaus.jackson.map.ObjectMapper;
+ 
+@@ -715,6 +716,7 @@ public class RpcServer implements RpcServerInterface, ConfigurationObserver {
+ 
+       @Override
+       public void run() {
++        SetStage.setStage(SetStage.HBASE_RPC_READER_STAGE);
+         try {
+           doRunLoop();
+         } finally {
+@@ -939,6 +941,7 @@ public class RpcServer implements RpcServerInterface, ConfigurationObserver {
+ 
+     @Override
+     public void run() {
++      SetStage.setStage(SetStage.HBASE_RPC_RESPONDER_STAGE);
+       LOG.info(getName() + ": starting");
+       try {
+         doRunLoop();
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/SimpleRpcScheduler.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/SimpleRpcScheduler.java
+index 3ea28879e..ebad0bb0f 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/SimpleRpcScheduler.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/SimpleRpcScheduler.java
+@@ -150,6 +150,7 @@ public class SimpleRpcScheduler extends RpcScheduler implements ConfigurationObs
+   private final RpcExecutor callExecutor;
+   private final RpcExecutor priorityExecutor;
+   private final RpcExecutor replicationExecutor;
++  private final int stageId;
+ 
+   /** What level a high priority call is at. */
+   private final int highPriorityLevel;
+@@ -171,7 +172,7 @@ public class SimpleRpcScheduler extends RpcScheduler implements ConfigurationObs
+       int replicationHandlerCount,
+       PriorityFunction priority,
+       Abortable server,
+-      int highPriorityLevel) {
++      int highPriorityLevel, int stageId) {
+ 
+     int maxQueueLength = conf.getInt(RpcScheduler.IPC_SERVER_MAX_CALLQUEUE_LENGTH,
+         handlerCount * RpcServer.DEFAULT_MAX_CALLQUEUE_LENGTH_PER_HANDLER);
+@@ -181,6 +182,7 @@ public class SimpleRpcScheduler extends RpcScheduler implements ConfigurationObs
+     this.priority = priority;
+     this.highPriorityLevel = highPriorityLevel;
+     this.abortable = server;
++    this.stageId = stageId;
+ 
+     String callQueueType = conf.get(CALL_QUEUE_TYPE_CONF_KEY, CALL_QUEUE_TYPE_CONF_DEFAULT);
+     float callqReadShare = conf.getFloat(CALL_QUEUE_READ_SHARE_CONF_KEY, 0);
+@@ -202,19 +204,19 @@ public class SimpleRpcScheduler extends RpcScheduler implements ConfigurationObs
+       if (isDeadlineQueueType(callQueueType)) {
+         CallPriorityComparator callPriority = new CallPriorityComparator(conf, this.priority);
+         callExecutor = new RWQueueRpcExecutor("DeadlineRWQ.default", handlerCount, numCallQueues,
+-            callqReadShare, callqScanShare, maxQueueLength, conf, abortable,
++            callqReadShare, callqScanShare, maxQueueLength, conf, abortable, stageId, 
+             BoundedPriorityBlockingQueue.class, callPriority);
+       } else if (isCodelQueueType(callQueueType)) {
+         Object[] callQueueInitArgs = {maxQueueLength, codelTargetDelay, codelInterval,
+           codelLifoThreshold, numGeneralCallsDropped, numLifoModeSwitches};
+         callExecutor = new RWQueueRpcExecutor("CodelRWQ.default", handlerCount,
+-          numCallQueues, callqReadShare, callqScanShare,
++          numCallQueues, callqReadShare, callqScanShare, stageId,
+           AdaptiveLifoCoDelCallQueue.class, callQueueInitArgs,
+           AdaptiveLifoCoDelCallQueue.class, callQueueInitArgs);
+       } else {
+         // FifoWFPBQ = FastPathBalancedQueueRpcExecutor
+         callExecutor = new RWQueueRpcExecutor("FifoRWQ.default", handlerCount, numCallQueues,
+-          callqReadShare, callqScanShare, maxQueueLength, conf, abortable);
++          callqReadShare, callqScanShare, maxQueueLength, conf, abortable, stageId);
+       }
+     } else {
+       // multiple queues
+@@ -222,26 +224,26 @@ public class SimpleRpcScheduler extends RpcScheduler implements ConfigurationObs
+         CallPriorityComparator callPriority = new CallPriorityComparator(conf, this.priority);
+         callExecutor =
+           new BalancedQueueRpcExecutor("DeadlineBQ.default", handlerCount, numCallQueues,
+-            conf, abortable, BoundedPriorityBlockingQueue.class, maxQueueLength, callPriority);
++            conf, abortable, stageId, BoundedPriorityBlockingQueue.class, maxQueueLength, callPriority);
+       } else if (isCodelQueueType(callQueueType)) {
+         callExecutor =
+           new FastPathBalancedQueueRpcExecutor("CodelFPBQ.default", handlerCount, numCallQueues,
+-            conf, abortable, AdaptiveLifoCoDelCallQueue.class, maxQueueLength,
++            conf, abortable, stageId, AdaptiveLifoCoDelCallQueue.class, maxQueueLength,
+             codelTargetDelay, codelInterval, codelLifoThreshold,
+             numGeneralCallsDropped, numLifoModeSwitches);
+       } else {
+         // FifoWFPBQ = FastPathBalancedQueueRpcExecutor
+         callExecutor = new FastPathBalancedQueueRpcExecutor("FifoWFPBQ.default",
+-            handlerCount, numCallQueues, maxQueueLength, conf, abortable);
++            handlerCount, numCallQueues, maxQueueLength, conf, abortable, stageId);
+       }
+     }
+     // Create 2 queues to help priorityExecutor be more scalable.
+     this.priorityExecutor = priorityHandlerCount > 0?
+       new FastPathBalancedQueueRpcExecutor("FifoWFPBQ.priority", priorityHandlerCount,
+-         2, maxPriorityQueueLength, conf, abortable): null;
++         2, maxPriorityQueueLength, conf, abortable, stageId): null;
+     this.replicationExecutor = replicationHandlerCount > 0?
+       new FastPathBalancedQueueRpcExecutor("FifoWFPBQ.replication",
+-        replicationHandlerCount, 1, maxQueueLength, conf, abortable) : null;
++        replicationHandlerCount, 1, maxQueueLength, conf, abortable, stageId) : null;
+   }
+ 
+   private static boolean isDeadlineQueueType(final String callQueueType) {
+@@ -258,9 +260,9 @@ public class SimpleRpcScheduler extends RpcScheduler implements ConfigurationObs
+ 	      int priorityHandlerCount,
+ 	      int replicationHandlerCount,
+ 	      PriorityFunction priority,
+-	      int highPriorityLevel) {
++	      int highPriorityLevel, int stageId) {
+ 	  this(conf, handlerCount, priorityHandlerCount, replicationHandlerCount, priority,
+-	    null, highPriorityLevel);
++	    null, highPriorityLevel, stageId);
+   }
+ 
+   @Override
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+index 810f95be4..32ce8aec6 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+@@ -56,6 +56,7 @@ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.util.SetStage;
+ import org.apache.hadoop.hbase.ClusterStatus;
+ import org.apache.hadoop.hbase.CoordinatedStateException;
+ import org.apache.hadoop.hbase.CoordinatedStateManager;
+@@ -227,6 +228,7 @@ public class HMaster extends HRegionServer implements MasterServices {
+ 
+     @Override
+     public void run() {
++      SetStage.setStage(SetStage.HBASE_HMASTER_MAIN_STAGE);
+       try {
+         while (!master.isStopped() && master.isActiveMaster()) {
+           Thread.sleep(timeout);
+@@ -2452,6 +2454,7 @@ public class HMaster extends HRegionServer implements MasterServices {
+    * @see org.apache.hadoop.hbase.master.HMasterCommandLine
+    */
+   public static void main(String [] args) {
++    SetStage.setStage(SetStage.HBASE_HMASTER_MAIN_STAGE);
+     VersionInfo.logVersion();
+     new HMasterCommandLine(HMaster.class).doMain(args);
+   }
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactSplitThread.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactSplitThread.java
+index c1f82b98a..d02864fe2 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactSplitThread.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactSplitThread.java
+@@ -48,6 +48,7 @@ import org.apache.hadoop.hbase.util.Pair;
+ import org.apache.hadoop.hbase.util.StealJobQueue;
+ import org.apache.hadoop.ipc.RemoteException;
+ import org.apache.hadoop.util.StringUtils;
++import org.apache.hadoop.util.SetStage;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Preconditions;
+@@ -124,7 +125,14 @@ public class CompactSplitThread implements CompactionRequestor, PropagatingConfi
+         new ThreadFactory() {
+           @Override
+           public Thread newThread(Runnable r) {
+-            Thread t = new Thread(r);
++            Runnable newRunnale = new Runnable(){
++                @Override
++                public void run(){
++                    SetStage.setStage(SetStage.HBASE_LONG_COMPACTION_STAGE);
++                    r.run();
++                }
++            };
++            Thread t = new Thread(newRunnale);
+             t.setName(n + "-longCompactions-" + System.currentTimeMillis());
+             return t;
+           }
+@@ -136,7 +144,14 @@ public class CompactSplitThread implements CompactionRequestor, PropagatingConfi
+         new ThreadFactory() {
+           @Override
+           public Thread newThread(Runnable r) {
+-            Thread t = new Thread(r);
++            Runnable newRunnale = new Runnable(){
++                @Override
++                public void run(){
++                    SetStage.setStage(SetStage.HBASE_SHORT_COMPACTION_STAGE);
++                    r.run();
++                }
++            };
++            Thread t = new Thread(newRunnale);
+             t.setName(n + "-shortCompactions-" + System.currentTimeMillis());
+             return t;
+           }
+@@ -148,7 +163,14 @@ public class CompactSplitThread implements CompactionRequestor, PropagatingConfi
+             new ThreadFactory() {
+           @Override
+           public Thread newThread(Runnable r) {
+-            Thread t = new Thread(r);
++            Runnable newRunnale = new Runnable(){
++                @Override
++                public void run(){
++                    SetStage.setStage(SetStage.HBASE_SPLIT_STAGE);
++                    r.run();
++                }
++            };
++            Thread t = new Thread(newRunnale);
+             t.setName(n + "-splits-" + System.currentTimeMillis());
+             return t;
+           }
+@@ -158,7 +180,14 @@ public class CompactSplitThread implements CompactionRequestor, PropagatingConfi
+         mergeThreads, new ThreadFactory() {
+           @Override
+           public Thread newThread(Runnable r) {
+-            Thread t = new Thread(r);
++            Runnable newRunnale = new Runnable(){
++                @Override
++                public void run(){
++                    SetStage.setStage(SetStage.HBASE_MERGE_STAGE);
++                    r.run();
++                }
++            };
++            Thread t = new Thread(newRunnale);
+             t.setName(n + "-merges-" + System.currentTimeMillis());
+             return t;
+           }
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/FifoRpcSchedulerFactory.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/FifoRpcSchedulerFactory.java
+index f4b51ba38..56caf0cdd 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/FifoRpcSchedulerFactory.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/FifoRpcSchedulerFactory.java
+@@ -33,7 +33,7 @@ import org.apache.hadoop.hbase.ipc.RpcScheduler;
+ @InterfaceStability.Evolving
+ public class FifoRpcSchedulerFactory implements RpcSchedulerFactory {
+   @Override
+-  public RpcScheduler create(Configuration conf, PriorityFunction priority, Abortable server) {
++  public RpcScheduler create(Configuration conf, PriorityFunction priority, Abortable server, int stageId) {
+     int handlerCount = conf.getInt(HConstants.REGION_SERVER_HANDLER_COUNT,
+       HConstants.DEFAULT_REGION_SERVER_HANDLER_COUNT);
+     return new FifoRpcScheduler(conf, handlerCount);
+@@ -41,7 +41,7 @@ public class FifoRpcSchedulerFactory implements RpcSchedulerFactory {
+ 
+   @Deprecated
+   @Override
+-  public RpcScheduler create(Configuration conf, PriorityFunction priority) {
+-    return create(conf, priority, null);
++  public RpcScheduler create(Configuration conf, PriorityFunction priority, int stageId) {
++    return create(conf, priority, null, stageId);
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index e5519f77b..eb75ac048 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -72,6 +72,7 @@ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.util.SetStage;
+ import org.apache.hadoop.hbase.ChoreService;
+ import org.apache.hadoop.hbase.ClockOutOfSyncException;
+ import org.apache.hadoop.hbase.CoordinatedStateManager;
+@@ -943,6 +944,7 @@ public class HRegionServer extends HasThread implements
+    */
+   @Override
+   public void run() {
++    SetStage.setStage(SetStage.HBASE_HRS_MAIN_STAGE);
+     try {
+       // Do pre-registration initializations; zookeeper, lease threads, etc.
+       preRegistrationInitialization();
+@@ -2763,6 +2765,7 @@ public class HRegionServer extends HasThread implements
+    * @see org.apache.hadoop.hbase.regionserver.HRegionServerCommandLine
+    */
+   public static void main(String[] args) throws Exception {
++    SetStage.setStage(SetStage.HBASE_HRS_MAIN_STAGE);
+     VersionInfo.logVersion();
+     Configuration conf = HBaseConfiguration.create();
+     @SuppressWarnings("unchecked")
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Leases.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Leases.java
+index 1373e27b1..e673651d6 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Leases.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Leases.java
+@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.regionserver;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.util.SetStage;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+ import org.apache.hadoop.hbase.util.HasThread;
+@@ -77,6 +78,7 @@ public class Leases extends HasThread {
+    */
+   @Override
+   public void run() {
++    SetStage.setStage(SetStage.HBASE_LEASE_STAGE);
+     long toWait = leaseCheckFrequency;
+     Lease nextLease = null;
+     long nextLeaseDelay = Long.MAX_VALUE;
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/LogRoller.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/LogRoller.java
+index fa217eec8..d9295323e 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/LogRoller.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/LogRoller.java
+@@ -26,6 +26,7 @@ import java.util.concurrent.locks.ReentrantLock;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.util.SetStage;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.Server;
+@@ -110,6 +111,7 @@ public class LogRoller extends HasThread {
+ 
+   @Override
+   public void run() {
++    SetStage.setStage(SetStage.HBASE_LOG_ROLL_STAGE);
+     while (!server.isStopped()) {
+       long now = System.currentTimeMillis();
+       boolean periodic = false;
+@@ -208,4 +210,4 @@ public class LogRoller extends HasThread {
+     }
+     return true;
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreFlusher.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreFlusher.java
+index 8f78a3b6b..c734b34a2 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreFlusher.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreFlusher.java
+@@ -59,6 +59,7 @@ import org.apache.hadoop.hbase.util.Threads;
+ import org.apache.hadoop.ipc.RemoteException;
+ import org.apache.hadoop.util.StringUtils;
+ import org.apache.hadoop.util.StringUtils.TraditionalBinaryPrefix;
++import org.apache.hadoop.util.SetStage;
+ import org.apache.htrace.Trace;
+ import org.apache.htrace.TraceScope;
+ 
+@@ -232,6 +233,7 @@ class MemStoreFlusher implements FlushRequester {
+ 
+     @Override
+     public void run() {
++      SetStage.setStage(SetStage.HBASE_FLUSH_STAGE);
+       while (!server.isStopped()) {
+         FlushQueueEntry fqe = null;
+         try {
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+index c01ea39c5..824984fd0 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+@@ -47,6 +47,7 @@ import java.util.concurrent.atomic.LongAdder;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.util.SetStage;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.ByteBufferedCell;
+ import org.apache.hadoop.hbase.Cell;
+@@ -1062,7 +1063,7 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+       rpcServer = new RpcServer(rs, name, getServices(),
+           bindAddress, // use final bindAddress for this server.
+           rs.conf,
+-          rpcSchedulerFactory.create(rs.conf, this, rs));
++          rpcSchedulerFactory.create(rs.conf, this, rs, SetStage.HBASE_RS_RPC_STAGE));
+     } catch (BindException be) {
+       String configName = (this instanceof MasterRpcServices) ? HConstants.MASTER_PORT :
+           HConstants.REGIONSERVER_PORT;
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RpcSchedulerFactory.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RpcSchedulerFactory.java
+index 7bc59daf8..b6396e491 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RpcSchedulerFactory.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RpcSchedulerFactory.java
+@@ -34,8 +34,8 @@ public interface RpcSchedulerFactory {
+   /**
+    * Constructs a {@link org.apache.hadoop.hbase.ipc.RpcScheduler}.
+    */
+-  RpcScheduler create(Configuration conf, PriorityFunction priority, Abortable server);
++  RpcScheduler create(Configuration conf, PriorityFunction priority, Abortable server, int stageId);
+ 
+   @Deprecated
+-  RpcScheduler create(Configuration conf, PriorityFunction priority);
+-}
+\ No newline at end of file
++  RpcScheduler create(Configuration conf, PriorityFunction priority, int stageId);
++}
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SimpleRpcSchedulerFactory.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SimpleRpcSchedulerFactory.java
+index 92462c845..c3f00eaea 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SimpleRpcSchedulerFactory.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SimpleRpcSchedulerFactory.java
+@@ -34,12 +34,12 @@ import org.apache.hadoop.hbase.ipc.SimpleRpcScheduler;
+ public class SimpleRpcSchedulerFactory implements RpcSchedulerFactory {
+   @Override
+   @Deprecated
+-  public RpcScheduler create(Configuration conf, PriorityFunction priority) {
+-	  return create(conf, priority, null);
++  public RpcScheduler create(Configuration conf, PriorityFunction priority, int stageId) {
++	  return create(conf, priority, null, stageId);
+   }
+ 
+   @Override
+-  public RpcScheduler create(Configuration conf, PriorityFunction priority, Abortable server) {
++  public RpcScheduler create(Configuration conf, PriorityFunction priority, Abortable server, int stageId) {
+     int handlerCount = conf.getInt(HConstants.REGION_SERVER_HANDLER_COUNT,
+         HConstants.DEFAULT_REGION_SERVER_HANDLER_COUNT);
+     return new SimpleRpcScheduler(
+@@ -51,6 +51,6 @@ public class SimpleRpcSchedulerFactory implements RpcSchedulerFactory {
+           HConstants.DEFAULT_REGION_SERVER_REPLICATION_HANDLER_COUNT),
+       priority,
+       server,
+-      HConstants.QOS_THRESHOLD);
++      HConstants.QOS_THRESHOLD, stageId);
+   }
+ }
+diff --git a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+index f93537d9d..225fee317 100644
+--- a/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
++++ b/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+@@ -45,6 +45,8 @@ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.util.SetStage;
++import org.apache.hadoop.util.SetStage;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.HRegionInfo;
+@@ -231,7 +233,7 @@ public class FSHLog extends AbstractFSWAL<Writer> {
+     // put on the ring buffer.
+     String hostingThreadName = Thread.currentThread().getName();
+     this.appendExecutor = Executors
+-        .newSingleThreadExecutor(Threads.getNamedThreadFactory(hostingThreadName + ".append"));
++        .newSingleThreadExecutor(Threads.getNamedStageThreadFactory(hostingThreadName + ".append", SetStage.HBASE_APPEND_STAGE));
+     // Preallocate objects to use on the ring buffer. The way that appends and syncs work, we will
+     // be stuck and make no progress if the buffer is filled with appends only and there is no
+     // sync. If no sync, then the handlers will be outstanding just waiting on sync completion
+@@ -590,6 +592,7 @@ public class FSHLog extends AbstractFSWAL<Writer> {
+     }
+ 
+     public void run() {
++      SetStage.setStage(SetStage.HBASE_SYNC_STAGE);
+       long currentSequence;
+       while (!isInterrupted()) {
+         int syncCount = 0;
+diff --git a/hbase/install.sh b/hbase/install.sh
+new file mode 100644
+index 000000000..81d6c36ca
+--- /dev/null
++++ b/hbase/install.sh
+@@ -0,0 +1,5 @@
++mvn install -e --offline -DskipTests -Pnative -Dmaven.javadoc.skip=true -Dmaven.test.skip=true
++#mvn install -U -e -DskipTests -Pnative -Dmaven.javadoc.skip=true -Dmaven.test.skip=true
++
++cp -R ../hadoop-2.7.1-src/set_stage/ .
++cp ../setup/hadoop/hbase-env.sh conf
+diff --git a/hbase/lib/java-allocation-instrumenter-3.0.1.jar b/hbase/lib/java-allocation-instrumenter-3.0.1.jar
+new file mode 100644
+index 000000000..4dc0bca70
+Binary files /dev/null and b/hbase/lib/java-allocation-instrumenter-3.0.1.jar differ
